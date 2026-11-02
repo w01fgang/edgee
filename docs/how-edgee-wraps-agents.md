@@ -376,6 +376,10 @@ OMP uses Pi's custom-provider schema. Edgee writes the same additive provider bl
 variables, and reuses the `pi` coding-agent key. Existing OMP providers and credentials remain
 untouched.
 
+Reasoning models use OMP's model-level `thinking` block. Its `efforts` come from the gateway
+catalog in canonical order, and the catalog value `none` is left out. Chat Completions models use
+`effort` mode. Claude models use `anthropic-adaptive` mode.
+
 ### Cursor (`edgee launch cursor`)
 
 Cursor's documented BYOK settings support an OpenAI-compatible base URL, API key, and custom

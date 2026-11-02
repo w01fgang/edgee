@@ -48,33 +48,9 @@ const ANTHROPIC_PROVIDER_KEY: &str = "edgee-anthropic";
 const API_KEY_ENV: &str = "EDGEE_API_KEY";
 const SESSION_ID_ENV: &str = "EDGEE_SESSION_ID";
 
-/// OMP's picker uses fixed slot names. The catalog's `none` effort maps to the
-/// disabled `off` slot.
-const THINKING_LEVELS: [(&str, &str); 7] = [
-    ("off", "none"),
-    ("minimal", "minimal"),
-    ("low", "low"),
-    ("medium", "medium"),
-    ("high", "high"),
-    ("xhigh", "xhigh"),
-    ("max", "max"),
-];
-
-fn thinking_level_map(efforts: &[String]) -> Value {
-    Value::Object(
-        THINKING_LEVELS
-            .into_iter()
-            .map(|(level, catalog_effort)| {
-                let value = if efforts.iter().any(|effort| effort == catalog_effort) {
-                    Value::String(catalog_effort.to_string())
-                } else {
-                    Value::Null
-                };
-                (level.to_string(), value)
-            })
-            .collect(),
-    )
-}
+/// OMP's effort ladder excludes the disabled state (`none` in the catalog).
+/// Keep canonical order: OMP clamps unavailable levels against this ladder.
+const THINKING_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Output cap declared for every model. The gateway catalog carries a context
 /// window but no per-model output limit, and there is no "unset" for
@@ -209,18 +185,22 @@ fn build_provider(
     }
 
     let gateway_url = gateway_url.trim_end_matches('/');
-    let (name, base_url, api) = match transport {
+    let (name, base_url, api, thinking_mode) = match transport {
         Transport::ChatCompletions => (
             "Edgee",
             format!("{gateway_url}/v1"),
             "openai-completions",
+            "effort",
         ),
         // The agent appends `/v1/messages` for this transport, matching its
         // built-in Anthropic provider. Including `/v1` here would duplicate it.
+        // The gateway accepts the adaptive thinking control and maps it to the
+        // ultimately selected Claude provider.
         Transport::AnthropicMessages => (
             "Edgee (Anthropic)",
             gateway_url.to_string(),
             "anthropic-messages",
+            "anthropic-adaptive",
         ),
     };
     let mut provider = serde_json::json!({
@@ -265,19 +245,17 @@ fn build_provider(
                         "cacheWrite": cost.cache_write,
                     });
                 }
-                if let Some(efforts) = metadata
-                    .map(|m| m.reasoning_efforts.as_slice())
-                    .filter(|efforts| !efforts.is_empty())
-                {
+                let supported = metadata.map_or(&[][..], |m| m.reasoning_efforts.as_slice());
+                let efforts: Vec<&str> = THINKING_EFFORTS
+                    .into_iter()
+                    .filter(|level| supported.iter().any(|effort| effort == level))
+                    .collect();
+                if !efforts.is_empty() {
                     entry["reasoning"] = Value::Bool(true);
-                    entry["thinkingLevelMap"] = thinking_level_map(efforts);
-                    if matches!(transport, Transport::AnthropicMessages) {
-                        // The gateway accepts the adaptive control and maps it
-                        // to the ultimately selected Claude provider.
-                        entry["compat"] = serde_json::json!({
-                            "forceAdaptiveThinking": true,
-                        });
-                    }
+                    entry["thinking"] = serde_json::json!({
+                        "mode": thinking_mode,
+                        "efforts": efforts,
+                    });
                 }
                 if matches!(transport, Transport::AnthropicMessages) {
                     // OMP's Anthropic transport deliberately speaks Claude Code's
@@ -607,11 +585,14 @@ mod tests {
         let model = &provider["models"][0];
 
         assert_eq!(model["reasoning"], serde_json::json!(true));
-        assert_eq!(model["thinkingLevelMap"]["off"], "none");
-        assert_eq!(model["thinkingLevelMap"]["minimal"], Value::Null);
-        for effort in ["low", "medium", "high", "xhigh", "max"] {
-            assert_eq!(model["thinkingLevelMap"][effort], effort);
-        }
+        assert_eq!(
+            model["thinking"],
+            serde_json::json!({
+                "mode": "effort",
+                "efforts": ["low", "medium", "high", "xhigh", "max"],
+            })
+        );
+        assert!(model.get("thinkingLevelMap").is_none());
         assert!(model.get("compat").is_none());
     }
 
@@ -626,9 +607,13 @@ mod tests {
         let provider = build_anthropic_provider("https://api.edgee.ai", &models, &catalog, None);
 
         assert_eq!(
-            provider["models"][0]["compat"]["forceAdaptiveThinking"],
-            true
+            provider["models"][0]["thinking"],
+            serde_json::json!({
+                "mode": "anthropic-adaptive",
+                "efforts": ["low", "medium", "high", "xhigh", "max"],
+            })
         );
+        assert!(provider["models"][0]["compat"].get("forceAdaptiveThinking").is_none());
     }
 
     #[test]
@@ -665,27 +650,27 @@ mod tests {
         );
 
         let provider = build_edgee_provider("https://api.edgee.ai", &models, &catalog, None);
-        let levels = &provider["models"][0]["thinkingLevelMap"];
-
-        assert_eq!(levels["off"], Value::Null);
-        assert_eq!(levels["minimal"], Value::Null);
-        assert_eq!(levels["low"], "low");
-        assert_eq!(levels["medium"], Value::Null);
-        assert_eq!(levels["high"], "high");
-        assert_eq!(levels["xhigh"], Value::Null);
-        assert_eq!(levels["max"], "max");
+        assert_eq!(
+            provider["models"][0]["thinking"],
+            serde_json::json!({
+                "mode": "effort",
+                "efforts": ["low", "high", "max"],
+            })
+        );
     }
 
     #[test]
     fn omits_reasoning_fields_without_catalog_efforts() {
         let models = vec!["openai/gpt-4.1".to_string()];
-        let catalog = catalog_with("openai/gpt-4.1", Some(1_000_000));
-
-        let provider = build_edgee_provider("https://api.edgee.ai", &models, &catalog, None);
-        let model = &provider["models"][0];
-        assert!(model.get("reasoning").is_none());
-        assert!(model.get("thinkingLevelMap").is_none());
-        assert!(model.get("compat").is_none());
+        for efforts in [&[][..], &["none"][..]] {
+            let catalog = catalog_with_efforts("openai/gpt-4.1", Some(1_000_000), efforts);
+            let provider = build_edgee_provider("https://api.edgee.ai", &models, &catalog, None);
+            let model = &provider["models"][0];
+            assert!(model.get("reasoning").is_none());
+            assert!(model.get("thinkingLevelMap").is_none());
+            assert!(model.get("thinking").is_none());
+            assert!(model.get("compat").is_none());
+        }
     }
 
     #[test]
